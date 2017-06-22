@@ -25,7 +25,24 @@ data LispVal = Atom String
              | Ratio Rational
              | Integer Integer
              | Vec (V.Vector LispVal) -- immutable so not true constant access
-             deriving (Eq, Show)
+             deriving (Eq)
+
+instance Show LispVal where
+  show (String contents)  = "\"" ++ contents ++ "\""
+  show (Atom name)        = name
+  show (Integer contents) = show contents
+  show (Float contents)   = show contents
+  show (Ratio contents)   = show contents
+  show (Complex contents) = show contents
+  show (C c)              = show c
+  show (Bool True)        = "#t"
+  show (Bool False)       = "#f"
+  show (List contents)    = "(" ++ unwordsList contents ++ ")"
+  show (DottedList h t)   = "(" ++ unwordsList h ++ " . " ++ show t ++ ")"
+  show (Vec contents)     = "#(" ++ unwordsList (V.toList contents) ++ ")"
+
+unwordsList :: [LispVal] -> String
+unwordsList = unwords . map show
 
 data Character =
     Single Char
