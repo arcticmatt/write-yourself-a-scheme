@@ -9,6 +9,7 @@ import Data.Ratio
 import Data.Complex
 import Control.Monad (void)
 import qualified Data.Vector as V
+import Data.Maybe
 
 import Text.Megaparsec
 import Text.Megaparsec.String
@@ -61,7 +62,7 @@ type CharacterName = String
 
 characterMap :: M.Map CharacterName Character
 characterMap = M.fromList
-   [("altmode", ESC)
+  [ ("altmode", ESC)
   , ("backnext", US)
   , ("backspace", BS)
   , ("call", SUB)
@@ -72,6 +73,17 @@ characterMap = M.fromList
   , ("rubout", DEL)
   , ("space", SPACE)
   , ("tab", HT)
+  ]
+
+primitives :: [(String, [LispVal] -> LispVal)]
+primitives =
+   [("+", numericBinop (+))
+  , ("-", numericBinop (-))
+  , ("*", numericBinop (*))
+  , ("-", numericBinop div)
+  , ("mod", numericBinop mod)
+  , ("quotient", numericBinop quot)
+  , ("remainder", numericBinop rem)
    ]
 
 -- *** Lexer Code ***
@@ -257,10 +269,10 @@ parseVector = do
   return $ Vec $ V.fromList items
 
 -- *** Run Functions ***
-readExpr :: String -> String
+readExpr :: String -> LispVal
 readExpr input = case parse parseExpr "lisp" input of
-  Left err -> "No match: " ++ show err
-  Right val -> "Found value: " ++ show val
+  Left err -> String $ "No match: " ++ show err
+  Right val -> val
 
 parseExpr :: Parser LispVal
 parseExpr = parseAtom
@@ -277,8 +289,38 @@ parseExpr = parseAtom
   <|> parseUnquote
   <|> parseList
 
+
+-- *** Evaluation ***
+eval :: LispVal -> LispVal
+eval val@(String _)  = val
+eval val@(Integer _) = val
+eval val@(Float _)   = val
+eval val@(Complex _) = val
+eval val@(Ratio _)   = val
+eval (List [Atom "quote", val]) = val
+eval (List (Atom func : args)) = apply func $ map eval args
+
+-- TODO: better error-checking
+apply :: String -> [LispVal] -> LispVal
+apply func args = maybe (Bool False) ($ args) $ lookup func primitives
+
+-- Takes a primitive Haskell function (often an operator section) and wraps it
+-- with code to unpack an argument list, apply the function to it, and
+-- wrap the result up in our Number constructor.
+numericBinop :: Num a => (a -> a -> a) -> [LispVal] -> LispVal
+numericBinop op params = Integer $ foldl1 op $ map unpackNum params
+
+-- Weak typing. If we can interpret strings or lists as a single number, do it.
+unpackNum :: LispVal -> Integer
+unpackNum (Integer n) = n
+unpackNum (String n) = let parsed = reads n :: [(Integer, String)] in
+  if null parsed
+    then 0 -- TODO: throw error?
+    else fst $ parsed !! 0
+unpackNum (List [n]) = unpackNum n
+unpackNum _ = 0
+
+
+
 main :: IO ()
-main = do
-  (expr:_) <- getArgs
-  putStrLn expr
-  putStrLn (readExpr expr)
+main = getArgs >>= print . eval . readExpr . head
