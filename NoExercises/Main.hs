@@ -1,15 +1,20 @@
+{-# LANGUAGE ExistentialQuantification #-}
 {-# OPTIONS_GHC -fno-warn-unused-do-bind #-}
 module Main where
 
 import System.Environment
 import Control.Monad (void)
+import Control.Exception
 
-import Text.Megaparsec
+import Text.Megaparsec as TM
 import Text.Megaparsec.String
 import qualified Text.Megaparsec.Lexer as L
 
 main :: IO ()
-main = getArgs >>= print . eval . readExpr . head
+main = do
+  args <- getArgs
+  let evaled = fmap show $ readExpr (head args) >>= eval
+  print evaled
 
 
 -- *** Data Structures & Types ***
@@ -33,7 +38,34 @@ instance Show LispVal where
 unwordsList :: [LispVal] -> String
 unwordsList = unwords . map show
 
-primitives :: [(String, [LispVal] -> LispVal)]
+data LispException =
+    NumArgs Integer [LispVal]
+  | TypeMismatch String LispVal
+  | Parser (ParseError (Token String) Dec)
+  | BadSpecialForm String LispVal
+  | NotFunction String String
+  | UnboundVar String String
+  | Default String
+
+instance Exception LispException
+
+instance Show LispException where
+  show (UnboundVar message varname)    = message ++ ": " ++ varname
+  show (BadSpecialForm message form)   = message ++ ": " ++ show form
+  show (NotFunction message func)      = message ++ ": " ++ show func
+  show (NumArgs expected found)        = "Expected " ++ show expected
+                                         ++ " args; found values " ++ unwordsList found
+  show (TypeMismatch expected found)   = "Invalid type: expected " ++ expected
+                                         ++ ", found " ++ show found
+  show (Parser parseErr)               = "Parse error at " ++ show parseErr
+  show (Default s)                     = "Default: " ++ s
+
+type ThrowsException = Either LispException
+
+-- Uses existential quantification
+data Unpacker = forall a. Eq a => AnyUnpacker (LispVal -> ThrowsException a)
+
+primitives :: [(String, [LispVal] -> ThrowsException LispVal)]
 primitives =
    [("+", numericBinop (+))
   , ("-", numericBinop (-))
@@ -42,8 +74,34 @@ primitives =
   , ("mod", numericBinop mod)
   , ("quotient", numericBinop quot)
   , ("remainder", numericBinop rem)
+  , ("=", numBoolBinop (==))
+  , ("<", numBoolBinop (<))
+  , (">", numBoolBinop (>))
+  , ("/=", numBoolBinop (/=))
+  , ("<=", numBoolBinop (<=))
+  , (">=", numBoolBinop (>=))
+  , ("&&", boolBoolBinop (&&))
+  , ("||", boolBoolBinop (||))
+  , ("string=?", strBoolBinop (==))
+  , ("string<?", strBoolBinop (<))
+  , ("string>?", strBoolBinop (>))
+  , ("string<=?", strBoolBinop (<=))
+  , ("string>=?", strBoolBinop (>=))
+  , ("car", car)
+  , ("cdr", cdr)
+  , ("cons", cons)
+  , ("eq?", eqv)
+  , ("eqv?", eqv)
+  , ("equal?", equal)
    ]
 
+
+-- *** Exception Code ***
+-- trapException action = catch action (return . show)
+
+-- extractValue :: ThrowsException a -> a
+-- extractValue (Right r) = r
+-- extractValue (Left l)  = l
 
 -- *** Lexer Code ***
 -- Space consumer
@@ -100,7 +158,7 @@ parseNumber = Number . read <$> some digitChar
 parseEitherList :: Parser LispVal
 parseEitherList = do
   openP
-  l <- try parseList <|> parseDottedList
+  l <- TM.try parseList <|> parseDottedList
   closeP
   return l
 
@@ -128,36 +186,136 @@ parseExpr =
   <|> parseQuoted
   <|> parseEitherList
 
-readExpr :: String -> LispVal
+readExpr :: String -> ThrowsException LispVal
 readExpr input = case parse parseExpr "lisp" input of
-  Left err  -> String $ "No match: " ++ show err
-  Right val -> val
-
+  Left err  -> Left $ Parser err
+  Right val -> return val
 
 
 -- *** Evaluation ***
-eval :: LispVal -> LispVal
-eval val@(String _) = val
-eval val@(Number _) = val
-eval val@(Bool _)   = val
-eval (List [Atom "quote", val]) = val
-eval (List (Atom func : args)) = apply func $ map eval args
+eval :: LispVal -> ThrowsException LispVal
+eval val@(String _) = return val
+eval val@(Number _) = return val
+eval val@(Bool _)   = return val
+eval (List [Atom "quote", val]) = return val
+eval (List [Atom "if", predicate, conseq, alt]) =
+  do result <- eval predicate
+     case result of
+       Bool False -> eval alt
+       Bool True  -> eval conseq
+       x          -> Left $ TypeMismatch "bool" x
+eval (List (Atom func : args)) = mapM eval args >>= apply func
+eval badForm = Left $ BadSpecialForm "Unrecognized special form" badForm
 
-apply :: String -> [LispVal] -> LispVal
-apply func args = maybe (Bool False) ($ args) $ lookup func primitives
+apply :: String -> [LispVal] -> ThrowsException LispVal
+apply func args = maybe (Left $ NotFunction "Unrecognized primitive function args" func)
+ ($ args) (lookup func primitives)
 
 -- Takes a primitive Haskell function (often an operator section) and wraps it
 -- with code to unpack an argument list, apply the function to it, and
 -- wrap the result up in our Number constructor.
-numericBinop :: (Integer -> Integer -> Integer) -> [LispVal] -> LispVal
-numericBinop op params = Number $ foldl1 op $ map unpackNum params
+numericBinop :: (Integer -> Integer -> Integer) -> [LispVal] -> ThrowsException LispVal
+numericBinop _ [] = Left $ NumArgs 2 []
+numericBinop _ [singleVal] = Left $ NumArgs 2 [singleVal]
+numericBinop op params = Number . foldl1 op <$> mapM unpackNum params
 
--- Weak typing. If we can interpret strings or lists as a single number, do it.
-unpackNum :: LispVal -> Integer
-unpackNum (Number n) = n
-unpackNum (String n) = let parsed = reads n :: [(Integer, String)] in
-  if null parsed
-    then 0 -- TODO: throw error?
-    else fst $ head parsed
+boolBinop :: (LispVal -> ThrowsException a) -> (a -> a -> Bool) -> [LispVal] -> ThrowsException LispVal
+boolBinop _ _ args | length args /= 2 = Left $ NumArgs 2 args
+boolBinop unpacker op [l, r] = do left <- unpacker l
+                                  right <- unpacker r
+                                  return $ Bool $ left `op` right
+
+numBoolBinop :: (Integer -> Integer -> Bool) -> [LispVal] -> ThrowsException LispVal
+numBoolBinop = boolBinop unpackNum
+
+strBoolBinop :: (String -> String -> Bool) -> [LispVal] -> ThrowsException LispVal
+strBoolBinop = boolBinop unpackStr
+
+boolBoolBinop :: (Bool -> Bool -> Bool) -> [LispVal] -> ThrowsException LispVal
+boolBoolBinop = boolBinop unpackBool
+
+-- Weak typing
+unpackNum :: LispVal -> ThrowsException Integer
+unpackNum (Number n) = return n
+unpackNum (String n) = let parsed = reads n in
+                           if null parsed
+                             then Left $ TypeMismatch "number" $ String n
+                             else return $ fst $ head parsed
 unpackNum (List [n]) = unpackNum n
-unpackNum _ = 0
+unpackNum notNum     = Left $ TypeMismatch "number" notNum
+
+-- Weak typing
+unpackStr :: LispVal -> ThrowsException String
+unpackStr (String s) = return s
+unpackStr (Number s) = return $ show s
+unpackStr (Bool s)   = return $ show s
+unpackStr notString  = Left $ TypeMismatch "string" notString
+
+unpackBool :: LispVal -> ThrowsException Bool
+unpackBool (Bool b) = return b
+unpackBool notBool  = Left $ TypeMismatch "bool" notBool
+
+unpackEquals :: LispVal -> LispVal -> Unpacker -> ThrowsException Bool
+unpackEquals arg1 arg2 (AnyUnpacker unpacker) =
+  case res of -- turn the error into a False result
+    Left _ -> return False
+    x      -> x
+  where
+    res = do unpacked1 <- unpacker arg1
+             unpacked2 <- unpacker arg2
+             return $ unpacked1 == unpacked2
+
+-- List functions
+car :: [LispVal] -> ThrowsException LispVal
+car [List (x:_)]         = return x
+car [DottedList (x:_) _] = return x
+car [DottedList [] x]    = return x
+car [badArg]             = Left $ TypeMismatch "pair" badArg
+car badArgList           = Left $ NumArgs 1 badArgList
+
+cdr :: [LispVal] -> ThrowsException LispVal
+cdr [List (_:xs)]         = return $ List xs
+cdr [DottedList [_] x]    = return x
+cdr [DottedList (_:xs) x] = return $ DottedList xs x
+cdr [badArg]              = Left $ TypeMismatch "pair" badArg
+cdr badArgList            = Left $ NumArgs 1 badArgList
+
+cons :: [LispVal] -> ThrowsException LispVal
+cons [x1, List []] = return $ List [x1]
+cons [x, List xs]  = return $ List (x:xs)
+cons [x, DottedList xs xlast] = return $ DottedList (x:xs) xlast
+cons [x1, x2]   = return $ DottedList [x1] x2
+cons badArgList = Left $ NumArgs 2 badArgList
+
+-- Equality testing
+eqv :: [LispVal] -> ThrowsException LispVal
+eqv [Bool arg1, Bool arg2]     = return $ Bool $ arg1 == arg2
+eqv [Number arg1, Number arg2] = return $ Bool $ arg1 == arg2
+eqv [String arg1, String arg2] = return $ Bool $ arg1 == arg2
+eqv [Atom arg1, Atom arg2]     = return $ Bool $ arg1 == arg2
+eqv [DottedList xs x, DottedList ys y] = eqv [List $ xs ++ [x], List $ ys ++ [y]]
+eqv [List arg1, List arg2] = return $ Bool $ (length arg1 == length arg2)
+  && (and $ zipWith go arg1 arg2)
+    where
+      go x1 x2 = case eqv [x1, x2] of
+        Left _ -> False
+        Right (Bool val) -> val
+        _ -> undefined
+eqv [_, _]     = return $ Bool False
+eqv badArgList = Left $ NumArgs 2 badArgList
+
+-- Use weak typing in an attempt to get equality
+equal :: [LispVal] -> ThrowsException LispVal
+equal [List arg1, List arg2] = return $ Bool $ (length arg1 == length arg2)
+  && (and $ zipWith go arg1 arg2)
+    where
+      go x1 x2 = case equal [x1, x2] of
+        Left _ -> False
+        Right (Bool val) -> val
+        _ -> undefined
+equal [arg1, arg2] = do
+      primitiveEquals <- or <$> mapM (unpackEquals arg1 arg2)
+                         [AnyUnpacker unpackNum, AnyUnpacker unpackStr, AnyUnpacker unpackBool]
+      eqvEquals <- eqv [arg1, arg2]
+      return $ Bool (primitiveEquals || let (Bool x) = eqvEquals in x)
+equal badArgList = Left $ NumArgs 2 badArgList
