@@ -2,6 +2,7 @@
 {-# OPTIONS_GHC -fno-warn-unused-do-bind #-}
 module Main where
 
+import System.IO
 import System.Environment
 import Control.Monad (void)
 import Control.Exception
@@ -10,11 +11,50 @@ import Text.Megaparsec as TM
 import Text.Megaparsec.String
 import qualified Text.Megaparsec.Lexer as L
 
+-- *** REPL Stuff ***
 main :: IO ()
 main = do
   args <- getArgs
-  let evaled = fmap show $ readExpr (head args) >>= eval
-  print evaled
+  case length args of
+    0 -> runRepl
+    1 -> evalAndPrint $ head args
+    _ -> putStrLn "Program takes only 0 or 1 argument"
+
+-- Prints string then flushes stdout
+flushStr :: String -> IO ()
+flushStr str = putStr str >> hFlush stdout
+
+-- Prints prompt, reads input
+readPrompt :: String -> IO String
+readPrompt prompt = flushStr prompt >> getLine
+
+-- Parses, evaluates, handles errors
+evalString :: String -> IO String
+evalString expr =
+  case evaled of
+    Left err -> return $ show err -- TODO: right now we just print the error
+    Right r  -> return $ r
+  where
+    evaled = fmap show $ readExpr expr >>= eval
+
+-- Evals and prints the result
+evalAndPrint :: String -> IO ()
+evalAndPrint expr = evalString expr >>= putStrLn
+
+-- The underscore after the name is a typical naming convention in Haskell for
+-- monadic functions that repeat but do not return a value
+-- predicate: signals when to stop
+-- prompt: action to perform before the test
+-- action: function-returning-an-action to do to the input
+until_ :: Monad m => (a -> Bool) -> m a -> (a -> m ()) -> m ()
+until_ predicate prompt action = do
+  result <- prompt
+  if predicate result
+    then return ()
+    else action result >> until_ predicate prompt action
+
+runRepl :: IO ()
+runRepl = until_ (== "quit") (readPrompt "Lisp>>> ") evalAndPrint
 
 
 -- *** Data Structures & Types ***
