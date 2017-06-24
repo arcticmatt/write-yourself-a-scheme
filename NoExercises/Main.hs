@@ -1,5 +1,5 @@
 {-# LANGUAGE ExistentialQuantification #-}
-{-# OPTIONS_GHC -fno-warn-unused-do-bind #-}
+{-# OPTIONS_GHC -fno-warn-unused-do-bind -fno-warn-name-shadowing #-}
 module Main where
 
 import System.IO
@@ -51,10 +51,10 @@ until_ predicate prompt action = do
     else action result >> until_ predicate prompt action
 
 runOne :: String -> IO ()
-runOne expr = nullEnv >>= flip evalAndPrint expr
+runOne expr = primitiveBindings >>= flip evalAndPrint expr
 
 runRepl :: IO ()
-runRepl = nullEnv >>= until_ (== "quit") (readPrompt "Lisp>>>") . evalAndPrint
+runRepl = primitiveBindings >>= until_ (== "quit") (readPrompt "Lisp>>>") . evalAndPrint
 -- runRepl = until_ (== "quit") (readPrompt "Lisp>>> ") evalAndPrint
 
 
@@ -65,7 +65,9 @@ data LispVal = Atom String
              | Number Integer
              | String String  -- Constructors and types have different namespaces!
              | Bool Bool
-             deriving (Eq)
+             | PrimitiveFunc ([LispVal] -> ThrowsException LispVal)
+             | Func { params :: [String], vararg :: Maybe String,
+                      body :: [LispVal], closure :: Env}
 
 instance Show LispVal where
   show (String contents) = "\"" ++ contents ++ "\""
@@ -75,6 +77,12 @@ instance Show LispVal where
   show (Bool False)      = "#f"
   show (List contents)   = "(" ++ unwordsList contents ++ ")"
   show (DottedList h t)  = "(" ++ unwordsList h ++ " . " ++ show t ++ ")"
+  show (PrimitiveFunc _) = "<primitive>"
+  show (Func {params = args, vararg = varargs, body = _, closure = _}) =
+    "(lambda (" ++ unwords (map show args) ++
+      (case varargs of
+        Nothing -> ""
+        Just arg -> " . " ++ arg) ++ ") ...)"
 
 unwordsList :: [LispVal] -> String
 unwordsList = unwords . map show
@@ -116,6 +124,15 @@ liftThrows (Right val) = return val
 
 runIOThrows :: IOThrowsException String -> IO String
 runIOThrows action = runExceptT (trapException action) >>= return . extractValue
+
+makeFunc :: (Show a, Monad m) => Maybe String -> Env -> [a] -> [LispVal] -> m LispVal
+makeFunc varargs env params body = return $ Func (map show params) varargs body env
+
+makeNormalFunc :: Env -> [LispVal] -> [LispVal] -> ExceptT LispException IO LispVal
+makeNormalFunc = makeFunc Nothing
+
+makeVarArgs :: LispVal -> Env -> [LispVal] -> [LispVal] -> ExceptT LispException IO LispVal
+makeVarArgs = makeFunc . Just . show
 
 -- Uses existential quantification
 data Unpacker = forall a. Eq a => AnyUnpacker (LispVal -> ThrowsException a)
@@ -267,12 +284,34 @@ eval env (List [Atom "if", predicate, conseq, alt]) =
        x          -> throwError $ TypeMismatch "bool" x
 eval env (List [Atom "set!", Atom var, form]) = eval env form >>= defineVar env var
 eval env (List [Atom "define", Atom var, form]) = eval env form >>= defineVar env var
-eval env (List (Atom func : args)) = mapM (eval env) args >>= liftThrows . apply func
+eval env (List (Atom "define" : List (Atom var : params) : body)) =
+     makeNormalFunc env params body >>= defineVar env var
+eval env (List (Atom "define" : DottedList (Atom var : params) varargs : body)) =
+     makeVarArgs varargs env params body >>= defineVar env var
+eval env (List (Atom "lambda" : List params : body)) =
+     makeNormalFunc env params body
+eval env (List (Atom "lambda" : DottedList params varargs : body)) =
+     makeVarArgs varargs env params body
+eval env (List (Atom "lambda" : varargs@(Atom _) : body)) =
+     makeVarArgs varargs env [] body
+eval env (List (function : args)) = do
+  func <- eval env function
+  argVals <- mapM (eval env) args
+  apply func argVals
 eval _ badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
 
-apply :: String -> [LispVal] -> ThrowsException LispVal
-apply func args = maybe (throwError $ NotFunction "Unrecognized primitive function args" func)
- ($ args) (lookup func primitives)
+apply :: LispVal -> [LispVal] -> IOThrowsException LispVal
+apply (PrimitiveFunc func) args = liftThrows $ func args
+apply (Func params varargs body closure) args =
+  if num params /= num args && varargs == Nothing
+    then throwError $ NumArgs (num params) args
+    else (liftIO $ bindVars closure $ zip params args) >>= bindVarArgs varargs >>= evalBody
+  where remainingArgs = drop (length params) args
+        num = toInteger . length
+        evalBody env = fmap last $ mapM (eval env) body
+        bindVarArgs arg env = case arg of
+          Just argName -> liftIO $ bindVars env [(argName, List $ remainingArgs)]
+          Nothing -> return env
 
 -- Takes a primitive Haskell function (often an operator section) and wraps it
 -- with code to unpack an argument list, apply the function to it, and
@@ -280,7 +319,7 @@ apply func args = maybe (throwError $ NotFunction "Unrecognized primitive functi
 numericBinop :: (Integer -> Integer -> Integer) -> [LispVal] -> ThrowsException LispVal
 numericBinop _ [] = throwError $ NumArgs 2 []
 numericBinop _ [singleVal] = throwError $ NumArgs 2 [singleVal]
-numericBinop op params = Number . foldl1 op <$> mapM unpackNum params
+numericBinop op params_ = Number . foldl1 op <$> mapM unpackNum params_
 
 boolBinop :: (LispVal -> ThrowsException a) -> (a -> a -> Bool) -> [LispVal] -> ThrowsException LispVal
 boolBinop _ _ args | length args /= 2 = throwError $ NumArgs 2 args
@@ -383,6 +422,11 @@ equal badArgList = throwError $ NumArgs 2 badArgList
 -- *** Environment stuff ***
 nullEnv :: IO Env
 nullEnv = newIORef []
+
+-- Binds primitives upon startup.
+primitiveBindings :: IO Env
+primitiveBindings = nullEnv >>= (flip bindVars $ map makePrimitiveFunc primitives)
+  where makePrimitiveFunc (var, func) = (var, PrimitiveFunc func)
 
 -- Determines if a given variable is already bound in the environment.
 -- Necessary for define.
