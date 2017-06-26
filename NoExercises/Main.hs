@@ -55,7 +55,7 @@ runOne args = do
     >>= hPutStrLn stderr
 
 runRepl :: IO ()
-runRepl = primitiveBindings >>= until_ (== "quit") (readPrompt "Lisp>>>") . evalAndPrint
+runRepl = primitiveBindings >>= until_ (== "quit") (readPrompt "Lisp>>> ") . evalAndPrint
 -- runRepl = until_ (== "quit") (readPrompt "Lisp>>> ") evalAndPrint
 
 
@@ -337,6 +337,7 @@ apply (Func params varargs body closure) args =
         bindVarArgs arg env = case arg of
           Just argName -> liftIO $ bindVars env [(argName, List $ remainingArgs)]
           Nothing -> return env
+apply (IOFunc func) args = func args
 
 applyProc :: [LispVal] -> IOThrowsException LispVal
 applyProc [func, List args] = apply func args
